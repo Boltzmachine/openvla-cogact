@@ -14,7 +14,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 from transformers import PreTrainedTokenizerBase
-
+import random
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
@@ -38,14 +38,18 @@ class RLDSBatchTransform:
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        
+        img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
+        if len(rlds_batch["observation"]["image_primary"]) > 1:
+            selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
+            other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
+        else:
+            other_img = None
         # For future action predictions
         if rlds_batch["action"].shape[0] > 1:
             dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"]
         else:
             dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
 
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
         # Construct Chat-based Prompt
@@ -92,7 +96,12 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=action, action_masks=action_mask)
+        if other_img is not None:
+            other_pixel_values = self.image_transform(other_img)
+        else:
+            other_pixel_values = None
+
+        return dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=action, action_masks=action_mask)
 
 
 class RLDSDataset(IterableDataset):
@@ -108,6 +117,7 @@ class RLDSDataset(IterableDataset):
         train: bool = True,
         image_aug: bool = False,
         load_all_data_for_training: bool = True,
+        backward_observation_window_size: int = 0,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -133,6 +143,7 @@ class RLDSDataset(IterableDataset):
             traj_transform_kwargs=dict(
                 window_size=past_action_window_size + 1,                                    # If we wanted to feed / predict more than one step
                 future_action_window_size=future_action_window_size,                        # For action chunking
+                backward_observation_window_size=backward_observation_window_size,
                 skip_unlabeled=True,                                                        # Skip trajectories without language labels
                 #goal_relabeling_strategy="uniform",                                        # Goals are currently unused
             ),

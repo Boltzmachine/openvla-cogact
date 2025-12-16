@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
-
+import random
 import numpy as np
 import timm
 import tokenizers
@@ -28,6 +28,7 @@ from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
+from vla_modules.utils import patch_projector
 
 # Get Logger
 logger = logging.getLogger(__name__)
@@ -286,6 +287,37 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         self.vocab_size = updated_embeddings.num_embeddings
 
         return updated_embeddings
+    
+    @property
+    def n_static_tokens(self):
+        if hasattr(self, 'disentangle_adapter'):
+            return self.disentangle_adapter.static_dim
+        if hasattr(self.config, "static_ratio"):
+            assert self.vision_backbone.get_num_patches() == 256
+            return int(self.vision_backbone.get_num_patches() * self.config.static_ratio)
+        raise ValueError("Cannot determine number of static tokens!")
+                
+    def patch_projector(self, static_ratio):
+        return patch_projector(self, static_ratio)
+
+
+    def _process_vision_features(self, pixel_values, use_disentangle=False):
+        patch_features = self.projector(patch_features)
+
+        if self.config.disentangle_method == "extra":
+            static_features, dynamic_features = self.disentangle_adapter(patch_features)
+            return static_features, dynamic_features
+        elif self.config.disentangle_method == "inject":
+            try:
+                static_dim = self.disentangle_adapter.original_module.static_dim
+            except:
+                static_dim = self.disentangle_adapter.static_dim
+            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+        elif use_disentangle:
+            static_dim = self.n_static_tokens
+            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+        else:
+            return patch_features
 
     # === Core Prismatic VLM `forward()` Logic ===
     def forward(
@@ -301,6 +333,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_projector_features: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        other_pixel_values: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -362,11 +395,28 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         elif (input_ids.shape[0] == pixel_values.shape[0]) or (inputs_embeds.shape[0] == pixel_values.shape[0]):
             assert past_key_values is None, "Unexpected key `past_key_values` provided during language-only forward!"
 
+            if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
+                # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
+                other_image_features = self._process_vision_features(self.projector(self.vision_backbone(other_pixel_values)), use_disentangle=True)
+                if isinstance(other_image_features, tuple):
+                    other_static, other_dynamic = other_image_features
+
             # Visual Feature Extraction
             patch_features = self.vision_backbone(pixel_values)
-
             # Projection Logic =>> Update Attention Mask
             projected_patch_embeddings = self.projector(patch_features)
+            # Get visual features
+            projected_patch_embeddings = self._process_vision_features(self.projector(patch_features), use_disentangle=other_pixel_values is not None)
+            if isinstance(projected_patch_embeddings, tuple):
+                static, dynamic = projected_patch_embeddings
+                if other_pixel_values is not None:
+                    if random.random() < self.config.invswap_ratio:
+                        projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                    else:
+                        projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
+                else:
+                    projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+
             projected_patch_attention_mask = None
             if attention_mask is not None:
                 projected_patch_attention_mask = torch.full(

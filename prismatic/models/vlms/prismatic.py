@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
+import random
 from typing import Callable, Dict, List, Optional, Type, Union
 
 import torch
@@ -26,6 +27,7 @@ from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.vlms.base_vlm import VLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
+from vla_modules.utils import patch_projector
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -304,6 +306,53 @@ class PrismaticVLM(VLM):
                 prismatic_fsdp_wrapping_policy,
             ],
         )
+    
+    @property
+    def n_static_tokens(self):
+        if hasattr(self, 'disentangle_adapter'):
+            return self.disentangle_adapter.static_dim
+        if hasattr(self.config, "static_ratio"):
+            assert self.vision_backbone.num_patches == 256
+            return int(self.vision_backbone.num_patches * self.config.static_ratio)
+        raise ValueError("Cannot determine number of static tokens!")
+                
+    def patch_projector(self, static_ratio):
+        from vla_modules import DisentangleAdapter
+        if "none" not in self.config.disentangle_method:
+            if "extra" in self.config.disentangle_method:
+                self.config.backbone = "query_transformer"
+                self.config.quantizer = "none"
+                hidden_dim = 4096
+            elif 'inject' in self.config.disentangle_method:
+                self.config.backbone = "none"
+                self.config.quantizer = "none"
+                hidden_dim = 1024
+            else:
+                raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
+            self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone="query_transformer", quantizer="none")
+
+        return self
+
+
+    def _process_vision_features(self, patch_features, use_disentangle=False):
+        patch_features = self.projector(patch_features)
+        if not hasattr(self.config, "disentangle_method"):
+            return patch_features
+        if self.config.disentangle_method == "extra":
+            static_features, dynamic_features = self.disentangle_adapter(patch_features)
+            return static_features, dynamic_features
+        elif self.config.disentangle_method == "inject":
+            try:
+                static_dim = self.disentangle_adapter.original_module.static_dim
+            except:
+                static_dim = self.disentangle_adapter.static_dim
+            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+        elif use_disentangle:
+            static_dim = self.n_static_tokens
+            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+        else:
+            return patch_features
+        
 
     # Note =>> We're not explicitly subclassing `PreTrainedModel` because we don't need the bloat; however, `forward()`
     #          *must* match the signature of a `{Model}ForCausalLM` so that we can inherit from `GenerationMixin`
@@ -322,6 +371,7 @@ class PrismaticVLM(VLM):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         multimodal_indices: Optional[torch.LongTensor] = None,
+        other_pixel_values: Optional[torch.FloatTensor] = None,
     ) -> CausalLMOutputWithPast:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
 
@@ -371,8 +421,41 @@ class PrismaticVLM(VLM):
             else:
                 patch_features = self.vision_backbone(pixel_values[multimodal_indices])
 
+        if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
+            with torch.set_grad_enabled(self.vision_backbone_requires_grad):
+                if isinstance(pixel_values, dict):
+                    other_patch_features = self.vision_backbone({k: other_pixel_values[k][multimodal_indices] for k in other_pixel_values})
+                else:
+                    other_patch_features = self.vision_backbone(other_pixel_values[multimodal_indices])
+            # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
+            other_image_features = self._process_vision_features(other_patch_features, use_disentangle=True)
+            if isinstance(other_image_features, tuple):
+                other_static, other_dynamic = other_image_features
+
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
-        projected_patch_embeddings = self.projector(patch_features)
+        projected_patch_embeddings = self._process_vision_features(patch_features, use_disentangle=other_pixel_values is not None)
+        if isinstance(projected_patch_embeddings, tuple):
+            static, dynamic = projected_patch_embeddings
+            if other_pixel_values is not None:
+                if torch.distributed.is_initialized():
+                    if torch.distributed.get_rank() == 0:
+                        rand_val = random.random()
+                    else:
+                        rand_val = 0.0 # Dummy value
+                    # Broadcast to all ranks
+                    rand_tensor = torch.tensor([rand_val], device=input_ids.device)
+                    torch.distributed.broadcast(rand_tensor, src=0)
+                else:
+                    rand_tensor = torch.tensor([3.0], device=input_ids.device)
+
+                if rand_tensor.item() < self.config.invswap_ratio:
+                    projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                else:
+                    projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
+            else:
+                projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+
+
         projected_patch_attention_mask = None
         if attention_mask is not None:
             projected_patch_attention_mask = torch.full(
@@ -467,7 +550,11 @@ class PrismaticVLM(VLM):
             fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
 
         # Run LLM Forward --> returns CausalLMOutputWithPast!
-        return self.llm_backbone(
+        if past_key_values is not None:
+            cache_length = past_key_values[0][0].shape[2]
+            fused_embeddings = fused_embeddings[:, cache_length:]
+            assert fused_labels is None
+        llm_outputs = self.llm_backbone(
             input_ids=None,
             attention_mask=fused_attention_mask,
             position_ids=None,
@@ -479,6 +566,9 @@ class PrismaticVLM(VLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        if 'other_static' in locals():
+            llm_outputs.statics = (static, other_static)
+        return llm_outputs
 
     # === GenerationMixin Methods ===
     #   => Note: The following methods override the functionality of `transformers.GenerationMixin`; these expect the
@@ -496,8 +586,8 @@ class PrismaticVLM(VLM):
         **kwargs: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Borrowed from `LlamaForCausalLM` --> in general, just handles caching logic during generation."""
-        if past_key_values:
-            input_ids = input_ids[:, -1:]
+        # if past_key_values:
+        #     input_ids = input_ids[:, -1:]
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
@@ -514,6 +604,9 @@ class PrismaticVLM(VLM):
                 "use_cache": use_cache,
             }
         )
+    
+        if 'other_pixel_values' in kwargs:
+            model_inputs['other_pixel_values'] = kwargs['other_pixel_values']
 
         return model_inputs
 

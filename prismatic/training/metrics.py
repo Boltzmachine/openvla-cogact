@@ -184,6 +184,7 @@ class Metrics:
         loss_raw = torch.stack(list(self.state["loss_raw"])).mean().item()
         loss = torch.stack(list(self.state["loss"])).mean().item()
         step_time, lr = np.mean(list(self.state["step_time"])), self.state["lr"][-1]
+        nce_loss = torch.stack(list(self.state["nce_loss"])).mean().item() if "nce_loss" in self.state else None
         status = self.get_status(loss)
 
         # Fire to Trackers
@@ -196,6 +197,7 @@ class Metrics:
                 f"{prefix}/Loss (Raw)": loss_raw,
                 f"{prefix}/Learning Rate": lr,
                 f"{prefix}/Step Time": step_time,
+                f"{prefix}/NCE Loss": nce_loss if nce_loss is not None else 0.0,
             },
         )
         return status

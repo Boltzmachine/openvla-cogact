@@ -33,6 +33,7 @@ def get_vla_dataset_and_collator(
     image_aug: bool = False,
     future_action_window_size: int = 0,
     past_action_window_size: int = 1,         # Concatenated `past_action_window_size-1' actions and the current action for the input
+    backward_observation_window_size: int = 0,
     load_all_data_for_training: bool = True,  # Load all data for training, or only a subset
     base_action_tokenizer: PreTrainedTokenizerBase = None
 ) -> Tuple[Dataset, ActionTokenizer, PaddedCollatorForActionPrediction]:
@@ -62,6 +63,7 @@ def get_vla_dataset_and_collator(
         past_action_window_size=past_action_window_size,
         image_aug=image_aug,
         load_all_data_for_training=load_all_data_for_training,
+        backward_observation_window_size=backward_observation_window_size,
     )
 
     return dataset, action_tokenizer, collator
