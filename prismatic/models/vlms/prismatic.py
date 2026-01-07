@@ -330,9 +330,8 @@ class PrismaticVLM(VLM):
             else:
                 raise ValueError(f"Unknown disentangle method: {self.config.disentangle_method}")
             self.disentangle_adapter = DisentangleAdapter(static_ratio=static_ratio, hidden_dim=hidden_dim, backbone="query_transformer", quantizer="none")
-
+    
         return self
-
 
     def _process_vision_features(self, patch_features, use_disentangle=False):
         patch_features = self.projector(patch_features)
@@ -353,6 +352,9 @@ class PrismaticVLM(VLM):
         else:
             return patch_features
         
+    def reset_episode(self):
+        self.history_image = None
+        self.time_gaps = []
 
     # Note =>> We're not explicitly subclassing `PreTrainedModel` because we don't need the bloat; however, `forward()`
     #          *must* match the signature of a `{Model}ForCausalLM` so that we can inherit from `GenerationMixin`
@@ -372,7 +374,9 @@ class PrismaticVLM(VLM):
         return_dict: Optional[bool] = None,
         multimodal_indices: Optional[torch.LongTensor] = None,
         other_pixel_values: Optional[torch.FloatTensor] = None,
-    ) -> CausalLMOutputWithPast:
+        timestep: Optional[torch.LongTensor] = None,
+        cache_gate: Optional[torch.nn.Module] = None,
+    ):
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
 
         # Handle Inference (leverage cache, short-circuit on just LLM forward)
@@ -432,26 +436,65 @@ class PrismaticVLM(VLM):
             if isinstance(other_image_features, tuple):
                 other_static, other_dynamic = other_image_features
 
+        if not hasattr(self, "_timestep"):
+            self._timestep = 0
+        self._timestep += 1
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
         projected_patch_embeddings = self._process_vision_features(patch_features, use_disentangle=other_pixel_values is not None)
+        if labels is None and getattr(self.config, "use_cache_gate", False):
+            assert not self.training
+            assert cache_gate is not None
+            if getattr(self.config, "use_cache_gate", False):
+                if self.history_image is None:
+                    self.history_image = (self._timestep, projected_patch_embeddings)
+                    self.time_gaps.append(0)
+                else:
+                    _, other_image_features = self.history_image
+                    _, gate_logits = cache_gate(
+                        x_past=other_image_features,
+                        x_curr=projected_patch_embeddings,
+                        t_past=None,
+                        t_curr=None,
+                    )
+                    recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
+                    if not hasattr(self, 'recache_probs'):
+                        self.recache_probs = []
+                    self.recache_probs.append(recache_prob)
+                    if recache_prob > self.recache_prob_threshold:
+                        past_key_values = None
+                        self.history_image = (self._timestep, projected_patch_embeddings)
+                        self.time_gaps.append(0)
+                    else:
+                        self.time_gaps[-1] += 1
+
         if isinstance(projected_patch_embeddings, tuple):
             static, dynamic = projected_patch_embeddings
             if other_pixel_values is not None:
-                if torch.distributed.is_initialized():
-                    if torch.distributed.get_rank() == 0:
-                        rand_val = random.random()
+                if self.config.use_cache_gate and timestep is not None and cache_gate is not None:
+                    gate, gate_logits = cache_gate(
+                        x_past=torch.cat([other_static['features'], other_dynamic], dim=1).to(torch.float32),
+                        x_curr=torch.cat([static['features'], dynamic], dim=1).to(torch.float32),
+                        t_past=timestep[..., 0],
+                        t_curr=timestep[..., 1],
+                    )
+                    static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
+                    projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
+                else:
+                    if torch.distributed.is_initialized():
+                        if torch.distributed.get_rank() == 0:
+                            rand_val = random.random()
+                        else:
+                            rand_val = 0.0 # Dummy value
+                        # Broadcast to all ranks
+                        rand_tensor = torch.tensor([rand_val], device=input_ids.device)
+                        torch.distributed.broadcast(rand_tensor, src=0)
                     else:
-                        rand_val = 0.0 # Dummy value
-                    # Broadcast to all ranks
-                    rand_tensor = torch.tensor([rand_val], device=input_ids.device)
-                    torch.distributed.broadcast(rand_tensor, src=0)
-                else:
-                    rand_tensor = torch.tensor([3.0], device=input_ids.device)
+                        rand_tensor = torch.tensor([random.random()], device=input_ids.device)
 
-                if rand_tensor.item() < self.config.invswap_ratio:
-                    projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
-                else:
-                    projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
+                    if rand_tensor.item() < self.config.invswap_ratio:
+                        projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                    else:
+                        projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
             else:
                 projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
 
@@ -568,6 +611,10 @@ class PrismaticVLM(VLM):
         )
         if 'other_static' in locals():
             llm_outputs.statics = (static, other_static)
+
+        if 'gate' in locals():
+            llm_outputs.gate = gate
+            llm_outputs.gate_logits = gate_logits
         return llm_outputs
 
     # === GenerationMixin Methods ===
@@ -607,6 +654,9 @@ class PrismaticVLM(VLM):
     
         if 'other_pixel_values' in kwargs:
             model_inputs['other_pixel_values'] = kwargs['other_pixel_values']
+
+        if 'cache_gate' in kwargs:
+            model_inputs['cache_gate'] = kwargs['cache_gate']
 
         return model_inputs
 

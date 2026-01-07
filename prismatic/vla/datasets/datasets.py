@@ -101,7 +101,7 @@ class RLDSBatchTransform:
         else:
             other_pixel_values = None
 
-        return dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=action, action_masks=action_mask)
+        return dict(pixel_values=pixel_values, other_pixel_values=other_pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=action, action_masks=action_mask, timestep=rlds_batch["observation"]['timestep'])
 
 
 class RLDSDataset(IterableDataset):

@@ -147,6 +147,7 @@ class PaddedCollatorForActionPrediction:
         actions = torch.stack(actions)
         action_masks = [instance["action_masks"] for instance in instances]
         action_masks = torch.stack(action_masks)
+        timestep = torch.tensor([instance["timestep"] for instance in instances], dtype=torch.long)
 
         output = dict(
             pixel_values=pixel_values,
@@ -156,6 +157,7 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
             action_masks=action_masks,
+            timestep=timestep,
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names

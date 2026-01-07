@@ -300,7 +300,6 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
     def patch_projector(self, static_ratio):
         return patch_projector(self, static_ratio)
 
-
     def _process_vision_features(self, pixel_values, use_disentangle=False):
         patch_features = self.projector(patch_features)
 
@@ -408,6 +407,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(self.projector(patch_features), use_disentangle=other_pixel_values is not None)
             if isinstance(projected_patch_embeddings, tuple):
+                raise NotImplementedError("Disentangle method not implemented!")
                 static, dynamic = projected_patch_embeddings
                 if other_pixel_values is not None:
                     if random.random() < self.config.invswap_ratio:
