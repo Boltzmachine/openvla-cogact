@@ -7,7 +7,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Tuple, Type, List, Union
 
 import numpy as np
 import torch
@@ -40,10 +40,9 @@ class RLDSBatchTransform:
         dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][-1])
         if len(rlds_batch["observation"]["image_primary"]) > 1:
-            selected_index = random.randint(0, len(rlds_batch["observation"]["image_primary"]) - 2)
-            other_img = Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index])
+            other_imgs = [Image.fromarray(rlds_batch["observation"]["image_primary"][selected_index]) for selected_index in range(len(rlds_batch["observation"]["image_primary"]) - 1)]
         else:
-            other_img = None
+            other_imgs = None
         # For future action predictions
         if rlds_batch["action"].shape[0] > 1:
             dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"]
@@ -96,8 +95,10 @@ class RLDSBatchTransform:
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        if other_img is not None:
-            other_pixel_values = self.image_transform(other_img)
+        if other_imgs is not None:
+            other_imgs_transformed = [self.image_transform(other_img) for other_img in other_imgs]
+            other_imgs_transformed = {k: [d[k] for d in other_imgs_transformed] for k in other_imgs_transformed[0]}
+            other_pixel_values = {k: torch.stack(v).squeeze(0) for k, v in other_imgs_transformed.items()}
         else:
             other_pixel_values = None
 
@@ -117,7 +118,7 @@ class RLDSDataset(IterableDataset):
         train: bool = True,
         image_aug: bool = False,
         load_all_data_for_training: bool = True,
-        backward_observation_window_size: int = 0,
+        backward_observation_window_size: Union[list[int], int] = 0,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform

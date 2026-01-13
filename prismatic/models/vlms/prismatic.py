@@ -312,8 +312,10 @@ class PrismaticVLM(VLM):
         if hasattr(self, 'disentangle_adapter'):
             return self.disentangle_adapter.static_dim
         if hasattr(self.config, "static_ratio"):
-            assert self.vision_backbone.num_patches == 256
-            return int(self.vision_backbone.num_patches * self.config.static_ratio)
+            if isinstance(self.config.static_ratio, float):
+                return int(self.vision_backbone.num_patches * self.config.static_ratio)
+            elif isinstance(self.config.static_ratio, (tuple, list)):
+                return [int(self.vision_backbone.num_patches * r) for r in self.config.static_ratio]
         raise ValueError("Cannot determine number of static tokens!")
                 
     def patch_projector(self, static_ratio):
@@ -348,14 +350,46 @@ class PrismaticVLM(VLM):
             return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
         elif use_disentangle:
             static_dim = self.n_static_tokens
-            return { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+            if isinstance(static_dim, int):
+                return patch_features, { "features": patch_features[:, :static_dim] }, patch_features[:, static_dim:]
+            elif isinstance(static_dim, list):
+                statics = []
+                static_cum = 0
+                for i, dim in enumerate(static_dim):
+                    statics.append({ "features": patch_features[:, static_cum:static_cum+dim] })
+                    static_cum += dim
+                return patch_features, tuple(statics), patch_features[:, static_cum:]
+            else:
+                raise ValueError("Invalid type for static_dim!")
         else:
             return patch_features
         
     def reset_episode(self):
         self.history_image = None
-        self.time_gaps = []
+        if isinstance(self.config.static_ratio, int):
+            if not hasattr(self, 'time_gaps'):
+                self.time_gaps = []
+            self.time_gaps.append(0)
+        elif isinstance(self.config.static_ratio, list):
+            if not hasattr(self, 'time_gaps'):
+                self.time_gaps = [[] for _ in range(len(self.config.static_ratio))]
+            for time_gaps in self.time_gaps:
+                time_gaps.append(0)
 
+    def truncate_cache(
+        self,
+        past_key_values,
+        length=None,
+    ):
+        if length is None:
+            length = self.n_static_tokens
+            if isinstance(length, list):
+                length = sum(length)
+        past_key_values = tuple(
+            (k_cache[:, :, :length, :], v_cache[:, :, :length, :])
+            for k_cache, v_cache in past_key_values
+        )
+        return past_key_values
     # Note =>> We're not explicitly subclassing `PreTrainedModel` because we don't need the bloat; however, `forward()`
     #          *must* match the signature of a `{Model}ForCausalLM` so that we can inherit from `GenerationMixin`
 
@@ -427,58 +461,111 @@ class PrismaticVLM(VLM):
 
         if other_pixel_values is not None and getattr(self.config, "invswap_ratio", 1.0) < 1.0:
             with torch.set_grad_enabled(self.vision_backbone_requires_grad):
-                if isinstance(pixel_values, dict):
-                    other_patch_features = self.vision_backbone({k: other_pixel_values[k][multimodal_indices] for k in other_pixel_values})
+                assert isinstance(pixel_values, dict)
+                if other_pixel_values['dino'].dim() == 5:
+                    other_image_features = []
+                    other_static = []
+                    other_dynamic = []
+                    for i in range(other_pixel_values['dino'].size(1)):
+                        other_patch_features = self.vision_backbone({k: other_pixel_values[k][:, i][multimodal_indices] for k in other_pixel_values})
+                        other_image_features_ = self._process_vision_features(other_patch_features, use_disentangle=True)
+                        if isinstance(other_image_features_, tuple):
+                            other, other_s, other_d = other_image_features_
+                            other_image_features.append(other)
+                            other_static.append(other_s)
+                            other_dynamic.append(other_d)
                 else:
-                    other_patch_features = self.vision_backbone(other_pixel_values[multimodal_indices])
-            # selected_future_index = torch.randint(0, other_pixel_values.size(1), (1,)).item()
-            other_image_features = self._process_vision_features(other_patch_features, use_disentangle=True)
-            if isinstance(other_image_features, tuple):
-                other_static, other_dynamic = other_image_features
-
+                    other_patch_features = self.vision_backbone({k: other_pixel_values[k][multimodal_indices] for k in other_pixel_values})
+                    other_image_features = self._process_vision_features(other_patch_features, use_disentangle=True)
+                    if isinstance(other_image_features, tuple):
+                        other_image_features, other_static, other_dynamic = other_image_features
+                        
         if not hasattr(self, "_timestep"):
             self._timestep = 0
         self._timestep += 1
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
         projected_patch_embeddings = self._process_vision_features(patch_features, use_disentangle=other_pixel_values is not None)
+
         if labels is None and getattr(self.config, "use_cache_gate", False):
+            if isinstance(projected_patch_embeddings, tuple):
+                image_features, _, _ = projected_patch_embeddings
+            else:
+                image_features = projected_patch_embeddings
             assert not self.training
             assert cache_gate is not None
             if getattr(self.config, "use_cache_gate", False):
                 if self.history_image is None:
-                    self.history_image = (self._timestep, projected_patch_embeddings)
-                    self.time_gaps.append(0)
+                    self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
                 else:
-                    _, other_image_features = self.history_image
+                    other_image_features = list(self.history_image)
                     _, gate_logits = cache_gate(
                         x_past=other_image_features,
-                        x_curr=projected_patch_embeddings,
+                        x_curr=image_features,
                         t_past=None,
                         t_curr=None,
                     )
-                    recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
-                    if not hasattr(self, 'recache_probs'):
-                        self.recache_probs = []
-                    self.recache_probs.append(recache_prob)
-                    if recache_prob > self.recache_prob_threshold:
-                        past_key_values = None
-                        self.history_image = (self._timestep, projected_patch_embeddings)
-                        self.time_gaps.append(0)
+                    if isinstance(gate_logits, list):
+                        recache_prob = tuple(gl.softmax(dim=-1)[:, 1].item() for gl in gate_logits) # batch size must be 1
+                        if not hasattr(self, 'recache_probs'):
+                            self.recache_probs = []
+                        self.recache_probs.append(recache_prob)
+                        assert len(recache_prob) == 2 #FIXME: only support 2 images now
+                        for i, recache_p in enumerate(recache_prob):
+                            if i == 0:
+                                if recache_p > self.recache_prob_threshold[0]:
+                                    past_key_values = None
+                                    self.history_image = (projected_patch_embeddings, projected_patch_embeddings)
+                                    for time_gaps in self.time_gaps:
+                                        time_gaps.append(0)
+                                    break
+                                else:
+                                    self.time_gaps[0][-1] += 1
+                            else:
+                                if recache_p > self.recache_prob_threshold[1]:
+                                    past_key_values = self.truncate_cache(past_key_values, length=self.n_static_tokens[i-1])
+                                    self.history_image = (self.history_image[0], projected_patch_embeddings)
+                                    self.time_gaps[i].append(0)
+                                else:
+                                    self.time_gaps[i][-1] += 1
                     else:
-                        self.time_gaps[-1] += 1
+                        recache_prob = gate_logits.softmax(dim=-1)[:, 1].item() # batch size must be 1
+                        if not hasattr(self, 'recache_probs'):
+                            self.recache_probs = []
+                        self.recache_probs.append(recache_prob)
+                        if recache_prob > 0.7:
+                            past_key_values = None
+                            self.history_image = projected_patch_embeddings
+                            self.time_gaps.append(0)
+                        else:
+                            self.time_gaps[-1] += 1
 
-        if isinstance(projected_patch_embeddings, tuple):
-            static, dynamic = projected_patch_embeddings
+        if isinstance(projected_patch_embeddings, tuple) and labels is not None:
+            image_features, static, dynamic = projected_patch_embeddings
             if other_pixel_values is not None:
-                if self.config.use_cache_gate and timestep is not None and cache_gate is not None:
+                if cache_gate is not None and self.config.use_cache_gate:
                     gate, gate_logits = cache_gate(
-                        x_past=torch.cat([other_static['features'], other_dynamic], dim=1).to(torch.float32),
-                        x_curr=torch.cat([static['features'], dynamic], dim=1).to(torch.float32),
-                        t_past=timestep[..., 0],
-                        t_curr=timestep[..., 1],
+                        x_past=other_image_features,
+                        x_curr=image_features,
+                        t_past=None,
+                        t_curr=None,
                     )
-                    static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
-                    projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
+                    if isinstance(gate, list):
+                        static_chosens = []
+                        prev_g = None
+                        for i in range(len(gate)):
+                            g = gate[i]
+                            os = other_static[i][i]
+                            cs = static[i]
+                            static_chosen = (g[:, :, None, None] * torch.stack([os['features'], cs['features']], dim=1)).sum(1)
+                            static_chosens.append(static_chosen)
+                            if prev_g is not None:
+                                assert ((prev_g[:, 1] - g[:, 1]) < 1e-5).all()
+                            prev_g = g
+                        static_chosens = torch.cat(static_chosens, dim=1)
+                        projected_patch_embeddings = torch.cat([static_chosens, dynamic], dim=1).contiguous()
+                    else:
+                        static_chosen = (gate[:, :, None, None] * torch.stack([other_static['features'], static['features']], dim=1)).sum(1)
+                        projected_patch_embeddings = torch.cat([static_chosen, dynamic], dim=1)
                 else:
                     if torch.distributed.is_initialized():
                         if torch.distributed.get_rank() == 0:
@@ -496,7 +583,7 @@ class PrismaticVLM(VLM):
                     else:
                         projected_patch_embeddings = torch.cat([other_static['features'], dynamic], dim=1)
             else:
-                projected_patch_embeddings = torch.cat([static['features'], dynamic], dim=1)
+                projected_patch_embeddings = image_features
 
 
         projected_patch_attention_mask = None
