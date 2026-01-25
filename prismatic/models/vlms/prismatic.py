@@ -16,6 +16,7 @@ from pathlib import Path
 import random
 from typing import Callable, Dict, List, Optional, Type, Union
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy
@@ -849,3 +850,385 @@ class PrismaticVLM(VLM):
         generated_text = tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
 
         return generated_text
+
+
+class ShouldReuse(Exception):
+    "a hack to reuse"
+
+
+class PrismaticVLMFlash(PrismaticVLM):
+    def reset_episode(self):
+        self.time_gaps = []
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        multimodal_indices: Optional[torch.LongTensor] = None,
+    ) -> CausalLMOutputWithPast:
+        """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
+
+        # Handle Inference (leverage cache, short-circuit on just LLM forward)
+        if input_ids.shape[1] == 1 and past_key_values is not None:
+            # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
+            output = self.llm_backbone(
+                input_ids=input_ids,
+                attention_mask=None,
+                position_ids=None,
+                past_key_values=past_key_values,
+                inputs_embeds=None,
+                labels=None,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            return output
+
+        elif input_ids.shape[1] == 1 or pixel_values is None:
+            raise RuntimeError("Invalid `forward()` call!")
+
+        # Handle Multimodal Indices is None --> pretend like the batch is fully multimodal (always image + text)!
+        if multimodal_indices is None:
+            multimodal_indices = torch.arange(len(input_ids), dtype=torch.long, device=input_ids.device)
+
+        # Handle Multimodal Indices is Empty (len == 0) --> simple unimodal forward
+        elif len(multimodal_indices) == 0:
+            return self.llm_backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=None,
+                past_key_values=past_key_values,
+                inputs_embeds=None,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+        # Run Visual Feature Extraction
+        with torch.set_grad_enabled(self.vision_backbone_requires_grad):
+            if isinstance(pixel_values, dict):
+                patch_features = self.vision_backbone({k: pixel_values[k][multimodal_indices] for k in pixel_values})
+            else:
+                patch_features = self.vision_backbone(pixel_values[multimodal_indices])
+
+        # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
+        projected_patch_embeddings = self.projector(patch_features)
+
+        topk = 200
+        U, S, Vh = torch.linalg.svd(projected_patch_embeddings.float(), full_matrices=False)
+        C = (U @ S.unsqueeze(-1)).squeeze(-1)
+        sig_token_inds = torch.topk(C, dim=-1, k=topk)[1]
+
+        if len(self.flash_memory.token_memory)>= 2:
+            assert len(self.flash_memory.action_memory) == 2
+            Is_2, Is_1 = self.flash_memory.token_memory
+            union = torch.cat((Is_2, Is_1), dim=-1).unique()
+            phi_s = torch.cat((Is_2, Is_1), dim=-1).unique().size(0) / Is_1.squeeze().size(0)
+            As_2 = self.flash_memory.action_memory[0][0]
+            As_1 = self.flash_memory.action_memory[1][0]
+            alpha_s = np.arccos(np.dot(As_2, As_1) / np.linalg.norm(As_2) / np.linalg.norm(As_1)) * 180 / np.pi
+
+            reuse_action = (alpha_s > self.flash_memory.e1) and (phi_s > (1 - self.flash_memory.delta /  Is_1.squeeze().size(0)))
+            reuse_action = False
+            if reuse_action and (not self.flash_memory.last_reuse):
+                self.time_gaps.append(0)
+                raise ShouldReuse
+        self.time_gaps.append(1)
+        self.flash_memory.token_memory.append(sig_token_inds)
+        self.flash_memory.last_reuse = False
+
+        projected_patch_attention_mask = None
+        if attention_mask is not None:
+            projected_patch_attention_mask = torch.full(
+                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
+                True,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+
+        # Get Input Embeddings from LLM Backbone :: [bsz, input_seq_len, llm_embed_dim]
+        input_embeddings = self.llm_backbone.embed_input_ids(input_ids)
+
+        # Build Multimodal Embeddings (and build resulting attention mask)
+        multimodal_embeddings = torch.cat(
+            [
+                input_embeddings[multimodal_indices, :1, :],
+                projected_patch_embeddings,
+                input_embeddings[multimodal_indices, 1:, :],
+            ],
+            dim=1,
+        )
+        multimodal_attention_mask = None
+        if attention_mask is not None:
+            multimodal_attention_mask = torch.cat(
+                [
+                    attention_mask[multimodal_indices, :1],
+                    projected_patch_attention_mask,
+                    attention_mask[multimodal_indices, 1:],
+                ],
+                dim=1,
+            )
+
+        # [Contract] We assume the first token of `labels` (associated with <BOS>) is already marked as "IGNORE"
+        #   => We'll ignore the per-token outputs for each of the patch embeddings as well!
+        multimodal_labels = None
+        if labels is not None:
+            projected_patch_labels = torch.full(
+                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
+                IGNORE_INDEX,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+            multimodal_labels = torch.cat(
+                [labels[multimodal_indices, :1], projected_patch_labels, labels[multimodal_indices, 1:]], dim=1
+            )
+
+        # === Add Unimodal Handling ===
+
+        # Create Fused Embeddings, Attention Mask, and Labels by Merging with "unimodal" Inputs (if applicable)
+        unimodal_indices = torch.tensor(
+            [idx for idx in range(len(input_ids)) if idx not in multimodal_indices],
+            dtype=torch.long,
+            device=multimodal_indices.device,
+        )
+
+        # No "unimodal" data --> Fused == Multimodal
+        if len(unimodal_indices) == 0:
+            fused_embeddings = multimodal_embeddings
+            fused_attention_mask = multimodal_attention_mask
+            fused_labels = multimodal_labels
+
+        else:
+            # Otherwise --> Merge w/ unimodal data
+
+            # This doesn't matter --> but in the "normal" case this is the embedding of the <PAD> token
+            #   => NOTE :: Verified that `zeros/randn/empty/<PAD> embedding` all return the same result!
+            unimodal_embeddings_pad = torch.zeros(
+                (len(unimodal_indices), projected_patch_embeddings.shape[1], input_embeddings.shape[2]),
+                dtype=input_embeddings.dtype,
+                device=input_embeddings.device,
+            )
+            unimodal_attention_pad = torch.full(
+                (len(unimodal_indices), projected_patch_embeddings.shape[1]),
+                False,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            unimodal_labels_pad = torch.full(
+                (len(unimodal_indices), projected_patch_embeddings.shape[1]),
+                IGNORE_INDEX,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+
+            unimodal_embeddings = torch.cat([input_embeddings[unimodal_indices], unimodal_embeddings_pad], dim=1)
+            unimodal_attention_mask = torch.cat([attention_mask[unimodal_indices], unimodal_attention_pad], dim=1)
+            unimodal_labels = torch.cat([labels[unimodal_indices], unimodal_labels_pad], dim=1)
+
+            # Create "Fused" Tensors by Stacking Multimodal & Unimodal
+            fused_embeddings = torch.vstack([multimodal_embeddings, unimodal_embeddings])
+            fused_attention_mask = torch.vstack([multimodal_attention_mask, unimodal_attention_mask])
+            fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
+        # Run LLM Forward --> returns CausalLMOutputWithPast!
+        return self.llm_backbone(
+            input_ids=None,
+            attention_mask=fused_attention_mask,
+            position_ids=None,
+            past_key_values=past_key_values,
+            inputs_embeds=fused_embeddings,
+            labels=fused_labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            pre_selected_reusable_patches=sig_token_inds + 1,
+        )
+
+class PrismaticVLMTTF(PrismaticVLM):
+    def reset_episode(self):
+        self.manager.reset_state()
+        self.time_gaps = []
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        multimodal_indices: Optional[torch.LongTensor] = None,
+    ) -> CausalLMOutputWithPast:
+        """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
+
+        # Handle Inference (leverage cache, short-circuit on just LLM forward)
+        if input_ids.shape[1] == 1 and past_key_values is not None:
+            # We're leveraging the cache, so just redirect to `self.llm_backbone` with `input_ids` and `past_key_values`
+            output = self.llm_backbone(
+                input_ids=input_ids,
+                attention_mask=None,
+                position_ids=None,
+                past_key_values=past_key_values,
+                inputs_embeds=None,
+                labels=None,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            return output
+
+        elif input_ids.shape[1] == 1 or pixel_values is None:
+            raise RuntimeError("Invalid `forward()` call!")
+
+        # Handle Multimodal Indices is None --> pretend like the batch is fully multimodal (always image + text)!
+        if multimodal_indices is None:
+            multimodal_indices = torch.arange(len(input_ids), dtype=torch.long, device=input_ids.device)
+
+        # Handle Multimodal Indices is Empty (len == 0) --> simple unimodal forward
+        elif len(multimodal_indices) == 0:
+            return self.llm_backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=None,
+                past_key_values=past_key_values,
+                inputs_embeds=None,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+        # Run Visual Feature Extraction
+        with torch.set_grad_enabled(self.vision_backbone_requires_grad):
+            if isinstance(pixel_values, dict):
+                patch_features = self.vision_backbone({k: pixel_values[k][multimodal_indices] for k in pixel_values})
+            else:
+                patch_features = self.vision_backbone(pixel_values[multimodal_indices])
+
+        # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
+        projected_patch_embeddings = self.projector(patch_features)
+
+        projected_patch_attention_mask = None
+        if attention_mask is not None:
+            projected_patch_attention_mask = torch.full(
+                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
+                True,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+
+        # Get Input Embeddings from LLM Backbone :: [bsz, input_seq_len, llm_embed_dim]
+        input_embeddings = self.llm_backbone.embed_input_ids(input_ids)
+
+        # Build Multimodal Embeddings (and build resulting attention mask)
+        multimodal_embeddings = torch.cat(
+            [
+                input_embeddings[multimodal_indices, :1, :],
+                projected_patch_embeddings,
+                input_embeddings[multimodal_indices, 1:, :],
+            ],
+            dim=1,
+        )
+        multimodal_attention_mask = None
+        if attention_mask is not None:
+            multimodal_attention_mask = torch.cat(
+                [
+                    attention_mask[multimodal_indices, :1],
+                    projected_patch_attention_mask,
+                    attention_mask[multimodal_indices, 1:],
+                ],
+                dim=1,
+            )
+
+        # [Contract] We assume the first token of `labels` (associated with <BOS>) is already marked as "IGNORE"
+        #   => We'll ignore the per-token outputs for each of the patch embeddings as well!
+        multimodal_labels = None
+        if labels is not None:
+            projected_patch_labels = torch.full(
+                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
+                IGNORE_INDEX,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+            multimodal_labels = torch.cat(
+                [labels[multimodal_indices, :1], projected_patch_labels, labels[multimodal_indices, 1:]], dim=1
+            )
+
+        # === Add Unimodal Handling ===
+
+        # Create Fused Embeddings, Attention Mask, and Labels by Merging with "unimodal" Inputs (if applicable)
+        unimodal_indices = torch.tensor(
+            [idx for idx in range(len(input_ids)) if idx not in multimodal_indices],
+            dtype=torch.long,
+            device=multimodal_indices.device,
+        )
+
+        # No "unimodal" data --> Fused == Multimodal
+        if len(unimodal_indices) == 0:
+            fused_embeddings = multimodal_embeddings
+            fused_attention_mask = multimodal_attention_mask
+            fused_labels = multimodal_labels
+
+        else:
+            # Otherwise --> Merge w/ unimodal data
+
+            # This doesn't matter --> but in the "normal" case this is the embedding of the <PAD> token
+            #   => NOTE :: Verified that `zeros/randn/empty/<PAD> embedding` all return the same result!
+            unimodal_embeddings_pad = torch.zeros(
+                (len(unimodal_indices), projected_patch_embeddings.shape[1], input_embeddings.shape[2]),
+                dtype=input_embeddings.dtype,
+                device=input_embeddings.device,
+            )
+            unimodal_attention_pad = torch.full(
+                (len(unimodal_indices), projected_patch_embeddings.shape[1]),
+                False,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            unimodal_labels_pad = torch.full(
+                (len(unimodal_indices), projected_patch_embeddings.shape[1]),
+                IGNORE_INDEX,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+
+            unimodal_embeddings = torch.cat([input_embeddings[unimodal_indices], unimodal_embeddings_pad], dim=1)
+            unimodal_attention_mask = torch.cat([attention_mask[unimodal_indices], unimodal_attention_pad], dim=1)
+            unimodal_labels = torch.cat([labels[unimodal_indices], unimodal_labels_pad], dim=1)
+
+            # Create "Fused" Tensors by Stacking Multimodal & Unimodal
+            fused_embeddings = torch.vstack([multimodal_embeddings, unimodal_embeddings])
+            fused_attention_mask = torch.vstack([multimodal_attention_mask, unimodal_attention_mask])
+            fused_labels = torch.vstack([multimodal_labels, unimodal_labels])
+        # Run LLM Forward --> returns CausalLMOutputWithPast!
+        return self.llm_backbone(
+            input_ids=None,
+            attention_mask=fused_attention_mask,
+            position_ids=None,
+            past_key_values=past_key_values,
+            inputs_embeds=fused_embeddings,
+            labels=fused_labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+

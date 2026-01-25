@@ -114,7 +114,6 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         self.llm_family = llm_family
         self.llm_max_length = llm_max_length
         self.inference_mode = inference_mode
-
         # Initialize LLM (downloading from HF Hub if necessary) --> `llm_cls` is the actual {Model}ForCausalLM class!
         #   => Note: We're eschewing use of the AutoModel API so that we can be more explicit about LLM-specific details
         if not self.inference_mode:
@@ -207,6 +206,7 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        **kwargs,
     ) -> CausalLMOutputWithPast:
         output: CausalLMOutputWithPast = self.llm(
             input_ids=input_ids,
@@ -219,5 +219,6 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            **kwargs,
         )
         return output

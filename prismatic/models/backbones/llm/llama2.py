@@ -10,6 +10,7 @@ import torch
 from torch import nn as nn
 from transformers import LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from prismatic.models.vlms.vla_cache.modeling_llama_vlacache import LlamaForCausalLMVLACache
 
 from prismatic.models.backbones.llm.base_llm import HFCausalLLMBackbone
 from prismatic.models.backbones.llm.prompting import (
@@ -24,6 +25,14 @@ from prismatic.models.backbones.llm.prompting import (
 LLAMA2_MODELS = {
     # === Pure Meta LLaMa-2 (non-instruct/chat-tuned) Models ===
     "llama2-7b-pure": {
+        "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "meta-llama/Llama-2-7b-hf"
+    },
+
+    "llama2-7b-flashvla-pure": {
+        "llm_family": "llama2", "llm_cls": LlamaForCausalLMVLACache, "hf_hub_path": "meta-llama/Llama-2-7b-hf"
+    },
+
+    "llama2-7b-ttf-pure": {
         "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "meta-llama/Llama-2-7b-hf"
     },
 

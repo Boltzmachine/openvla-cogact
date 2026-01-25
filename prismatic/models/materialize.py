@@ -14,6 +14,7 @@ from prismatic.models.backbones.vision import (
     CLIPViTBackbone,
     DinoCLIPViTBackbone,
     DinoSigLIPViTBackbone,
+    DinoSigLIPViTTTFBackbone,
     DinoV2ViTBackbone,
     ImageTransform,
     IN1KViTBackbone,
@@ -33,6 +34,8 @@ VISION_BACKBONES = {
     "dinov2-vit-l": {"cls": DinoV2ViTBackbone, "kwargs": {"default_image_size": 224}},
     "in1k-vit-l": {"cls": IN1KViTBackbone, "kwargs": {"default_image_size": 224}},
     "dinosiglip-vit-so-224px": {"cls": DinoSigLIPViTBackbone, "kwargs": {"default_image_size": 224}},
+    "dinosiglip-vit-so-ttf-224px": {"cls": DinoSigLIPViTTTFBackbone, "kwargs": {"default_image_size": 224}},
+    
 
     # === Assorted CLIP Backbones ===
     "clip-vit-b": {"cls": CLIPViTBackbone, "kwargs": {"default_image_size": 224}},
@@ -54,6 +57,8 @@ VISION_BACKBONES = {
 LLM_BACKBONES = {
     # === LLaMa-2 Pure (Non-Chat) Backbones ===
     "llama2-7b-pure": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
+    "llama2-7b-flashvla-pure": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
+    "llama2-7b-ttf-pure": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
     "llama2-13b-pure": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
 
     # === LLaMa-2 Chat Backbones ===

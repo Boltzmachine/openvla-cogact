@@ -23,6 +23,10 @@ DINOSigLIP_VISION_BACKBONES = {
         "dino": "vit_large_patch14_reg4_dinov2.lvd142m",
         "siglip": "vit_so400m_patch14_siglip_224",
     },
+    "dinosiglip-vit-so-ttf-224px": {
+        "dino": "vit_large_patch14_reg4_dinov2.lvd142m",
+        "siglip": "vit_so400m_patch14_siglip_224",
+    },
     "dinosiglip-vit-so-384px": {
         "dino": "vit_large_patch14_reg4_dinov2.lvd142m",
         "siglip": "vit_so400m_patch14_siglip_384",
@@ -162,3 +166,153 @@ class DinoSigLIPViTBackbone(VisionBackbone):
     @property
     def half_precision_dtype(self) -> torch.dtype:
         return torch.bfloat16
+
+class DinoSigLIPViTTTFBackbone(DinoSigLIPViTBackbone):
+    def forward(self, pixel_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+        manager = self.manager
+        if not manager.is_enabled():
+            raise
+            """Runs the transformed image/pixel tensors through each vision backbone, returning concatenated patches."""
+            dino_patches = self.dino_featurizer(pixel_values["dino"])
+            siglip_patches = self.siglip_featurizer(pixel_values["siglip"])
+
+            return torch.cat([dino_patches, siglip_patches], dim=2)
+        else:
+            current_shallow_features = None
+            # assert manager.fusion_mode == "pixel" # POST: only supported
+            # Preparation for semantic/pixel difference
+            img_dino, img_siglip = pixel_values["dino"], pixel_values["siglip"]
+            if manager.fusion_mode == "semantic":
+                raise
+                # 一次性获取DINOv2和SigLIP的深、浅两种特征
+                # === DINOv2 特征处理 ===
+                dino_features_list = self.featurizer.get_intermediate_layers(
+                    img_dino, n=[manager.semantic_shallow_layer, len(self.featurizer.blocks) - 2]
+                )
+                # 直接解包，不做任何切片
+                new_tokens_dino, shallow_dino = dino_features_list[1], dino_features_list[0]
+
+                # === SigLIP 特征处理 ===
+                siglip_features_list = self.fused_featurizer.get_intermediate_layers(
+                    img_siglip, n=[manager.semantic_shallow_layer, len(self.fused_featurizer.blocks) - 2]
+                )
+                # 直接解包，不做任何切片
+                new_tokens_siglip, shallow_siglip = siglip_features_list[1], siglip_features_list[0]
+
+                current_shallow_features = (shallow_dino, shallow_siglip)
+                # 计算语义权重，为两种融合模式做准备
+                dino_weights, siglip_weights = manager.get_semantic_fusion_weights(shallow_dino, shallow_siglip)
+            elif manager.fusion_mode == "pixel":
+                new_tokens_dino = self.dino_featurizer(img_dino)
+                new_tokens_siglip = self.siglip_featurizer(img_siglip)
+            elif manager.fusion_mode == "attention":
+                # For attention mode, we always compute new features
+                # The fusion will be guided by attention weights
+                new_tokens_dino = self.dino_featurizer(img_dino)
+                new_tokens_siglip = self.siglip_featurizer(img_siglip)
+            elif manager.fusion_mode == "hybrid":
+                # For hybrid mode, we always compute new features
+                # The fusion will be guided by both pixel and attention weights
+                new_tokens_dino = self.dino_featurizer(img_dino)
+                new_tokens_siglip = self.siglip_featurizer(img_siglip)
+            else:
+                assert False, "Invalid fusion mode, please use 'semantic', 'pixel', 'attention', or 'hybrid'!"
+
+            # hard fusion
+            if not manager.smooth_fusion_enabled:
+                if manager.is_keyframe():
+                    img_dino, img_siglip = pixel_values["dino"], pixel_values["siglip"]
+                    patches_main, patches_fused = self.dino_featurizer(img_dino), self.siglip_featurizer(img_siglip)
+                    patches = torch.cat([patches_main, patches_fused], dim=2)
+                # TOKEN REUSE CORE LOGIC
+                # we first try compute the entire new frame and combine it with the cached tokens, then we try only recomputing the dynamic regions.
+                else:
+                    # TOKEN REUSE CORE LOGIC
+                    # semantic difference
+                    if manager.fusion_mode == "semantic":
+                        raise
+                        recompute_mask_dino = dino_weights > manager.semantic_threshold
+                        recompute_mask_siglip = siglip_weights > manager.semantic_threshold
+                    # pixel difference
+                    elif manager.fusion_mode == "pixel":
+                        recompute_mask_dino, recompute_mask_siglip = manager.get_pixel_recompute_mask(pixel_values)
+                    # attention-guided difference
+                    elif manager.fusion_mode == "attention":
+                        recompute_mask_dino, recompute_mask_siglip = manager.get_attention_recompute_mask()
+                    # hybrid difference (pixel + attention)
+                    elif manager.fusion_mode == "hybrid":
+                        recompute_mask_dino, recompute_mask_siglip = manager.get_hybrid_recompute_mask(pixel_values)
+                    else:
+                        assert False, "Invalid fusion mode, please use 'semantic', 'pixel', 'attention', or 'hybrid'!"
+                    
+                    num_reused_dino = (~recompute_mask_dino).sum().item()
+                    num_reused_siglip = (~recompute_mask_siglip).sum().item()
+                    
+                    # Log attention-guided fusion info
+                    if manager.fusion_mode == "attention" and manager.step_counter % 10 == 0:
+                        print(f"  Vision backbone - VLA-Cache attention fusion")
+                        print(f"  DINO reused: {num_reused_dino}/256, SigLIP reused: {num_reused_siglip}/256")
+
+                    # 1. Separate the cached tokens for DINO and SigLIP
+                    # DINO tokens are the first 1024 dimensions, SigLIP are the next 1152.
+                    cached_tokens_dino, cached_tokens_siglip = torch.split(
+                        manager.last_vision_tokens, [1024, 1152], dim=2
+                    )
+
+                    # 3. Initialize final tokens with the cached versions
+                    final_tokens_dino = cached_tokens_dino.clone()
+                    final_tokens_siglip = cached_tokens_siglip.clone()
+                    
+                    # 4. Overwrite the dynamic regions with the newly computed tokens
+                    final_tokens_dino[0, recompute_mask_dino] = new_tokens_dino[0, recompute_mask_dino]
+                    final_tokens_siglip[0, recompute_mask_siglip] = new_tokens_siglip[0, recompute_mask_siglip]
+
+                    # 5. Concatenate the final DINO and SigLIP tokens
+                    patches = torch.cat([final_tokens_dino, final_tokens_siglip], dim=2)
+            # smooth fusion
+            else:                
+                raise
+                if manager.is_keyframe():
+                    img, img_fused = torch.split(pixel_values, [3, 3], dim=1)
+                    patches_main, patches_fused = self.featurizer(img), self.fused_featurizer(img_fused)
+                    patches = torch.cat([patches_main, patches_fused], dim=2)
+                # TOKEN REUSE CORE LOGIC
+                # we first try compute the entire new frame and combine it with the cached tokens, then we try only recomputing the dynamic regions.
+                else:
+                    if manager.fusion_mode == "semantic":
+                        dino_fusion_weights, siglip_fusion_weights = dino_weights, siglip_weights
+                    elif manager.fusion_mode == "pixel":
+                        dino_fusion_weights, siglip_fusion_weights = manager.get_fusion_weights(pixel_values)
+                    elif manager.fusion_mode == "attention":
+                        dino_fusion_weights, siglip_fusion_weights = manager.get_attention_fusion_weights()
+                    else:
+                        assert False, "Invalid fusion mode, please use 'semantic', 'pixel', or 'attention'!"
+                    
+                    num_reused_dino = (1 - dino_fusion_weights).sum().item()
+                    num_reused_siglip = (1 - siglip_fusion_weights).sum().item()
+
+                    # 1. Separate the cached tokens for DINO and SigLIP
+                    # DINO tokens are the first 1024 dimensions, SigLIP are the next 1152.
+                    cached_tokens_dino, cached_tokens_siglip = torch.split(
+                        manager.last_vision_tokens, [1024, 1152], dim=2
+                    )
+
+                    # 3. Prepare weights for broadcasting
+                    # Shape: (num_patches,) -> (1, num_patches, 1)
+                    dino_weights = dino_fusion_weights.unsqueeze(0).unsqueeze(-1)
+                    siglip_weights = siglip_fusion_weights.unsqueeze(0).unsqueeze(-1)
+                    # Convert weights to the same dtype as tokens to prevent mismatch
+                    dino_weights = dino_weights.to(new_tokens_dino.dtype)
+                    siglip_weights = siglip_weights.to(new_tokens_siglip.dtype)
+
+                    # 4. Perform smooth fusion using weighted average
+                    final_tokens_dino = (dino_weights * new_tokens_dino) + ((1 - dino_weights) * cached_tokens_dino)
+                    final_tokens_siglip = (siglip_weights * new_tokens_siglip) + ((1 - siglip_weights) * cached_tokens_siglip)
+
+                    # 5. Concatenate the final DINO and SigLIP tokens
+                    patches = torch.cat([final_tokens_dino, final_tokens_siglip], dim=2)
+
+        if manager.is_enabled():
+            manager.update_cache(pixel_values=pixel_values, vision_tokens=patches, shallow_features=current_shallow_features)
+
+        return patches
